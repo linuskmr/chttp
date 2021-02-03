@@ -1,0 +1,40 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/linus/CLionProjects/chttp/main.c
+stdio.h
+-
+netinet/in.h
+-
+pthread.h
+-
+signal.h
+-
+stdlib.h
+-
+string.h
+-
+sys/socket.h
+-
+sys/types.h
+-
+unistd.h
+-
+arpa/inet.h
+-
+errno.h
+-
+sys/mman.h
+-
+sys/stat.h
+-
+fcntl.h
+-
+dirent.h
+-
+

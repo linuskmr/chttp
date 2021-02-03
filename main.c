@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #define BACKLOG 8 // Maximum queue length of pending requests
 #define PORT 9601 // The server port
@@ -868,7 +869,7 @@ void create_socket() {
     printf("Listen to socket with backlog %d\n", BACKLOG);
 }
 
-void respond_text(FILE* client_stream, char* text, int status) {
+void respond_header(FILE* client_stream, size_t content_length, int status) {
     char* status_text;
     switch (status) {
         case 200:
@@ -886,48 +887,111 @@ void respond_text(FILE* client_stream, char* text, int status) {
     }
     fprintf(client_stream, "HTTP/1.1 %d %s\n", status, status_text);
     fputs("Server: chttp\n", client_stream);
-    fprintf(client_stream, "Content-length: %lu\n", strlen(text));
+    fprintf(client_stream, "Content-length: %lu\n", content_length);
     fputs("Content-type: text/html; charset=utf-8\n", client_stream);
     fputs("\r\n", client_stream);
-    fputs(text, client_stream);
 }
 
-void respond_errno(FILE* client_stream, char* text) {
-    char err_msg[128 + strlen(text)];
-    sprintf(err_msg, "<h1>Error %s</h1><p>%s: %s</p>", text, errno_name(errno), strerror(errno));
-    respond_text(client_stream, err_msg, 500);
+void respond_errno(FILE* client_stream, int errno_respond, char* text) {
+    char err_msg_template[] = "<h1>Error %s</h1><p>%s: %s</p>";
+    char err_msg[sizeof(err_msg_template) + strlen(text)];
+
+    // Compose message
+    sprintf(err_msg, err_msg_template, text, errno_name(errno_respond), strerror(errno_respond));
+    // Send header
+    respond_header(client_stream, strlen(err_msg), 500);
+    // Send content -> error message
+    fputs(err_msg, client_stream);
 }
 
 void respond_file(FILE* client_stream, char* path) {
     int file = open(path, O_RDONLY);
     if (file < 0) {
         fprintf(stderr, "Error opening file\n");
-        respond_errno(client_stream, "opening file");
-    }
-    struct stat stats;
-    fstat(file, &stats);
-
-    char* file_mem = mmap(NULL, stats.st_size, PROT_READ, MAP_PRIVATE, file, 0);
-    file_mem = MAP_FAILED;
-    errno = ENOMEM;
-    if (file_mem == MAP_FAILED) {
-        respond_errno(client_stream, "reading file");
+        respond_errno(client_stream, errno, "opening file");
         return;
     }
 
-    fprintf(client_stream, "HTTP/1.1 200 OK\n");
-    fprintf(client_stream, "Server: chttp\n");
-    fprintf(client_stream, "Content-length: %lu\n", stats.st_size);
-    fprintf(client_stream, "Content-type: text/html; charset=utf-8\n");
-    fprintf(client_stream, "\r\n");
-    fwrite(file_mem, sizeof(char), stats.st_size, client_stream);
-    munmap(file_mem, stats.st_size);
+    // Read file stats
+    struct stat stats;
+    fstat(file, &stats);
+
+    // Map file into memory
+    char* file_mmap = mmap(NULL, stats.st_size, PROT_READ, MAP_PRIVATE, file, 0);
+    if (file_mmap == MAP_FAILED) {
+        respond_errno(client_stream, errno, "reading file");
+        return;
+    }
+    // Send header
+    respond_header(client_stream, stats.st_size, 200);
+    // Send file
+    fwrite(file_mmap, sizeof(char), stats.st_size, client_stream);
+    // Unmap file from memory
+    munmap(file_mmap, stats.st_size);
+}
+
+void respond_directory(FILE* client_stream, char* path) {
+    DIR* dir;
+    struct dirent *dir_entry;
+    dir = opendir(path);
+    if (dir == NULL) {
+        perror("respond_directory: opendir");
+        respond_errno(client_stream, errno, "Could not open directory");
+        return;
+    }
+
+    // Write headline
+    size_t msg_len = 512;
+    char* msg = malloc(msg_len);
+    if (msg == NULL) {
+        perror("respond_directory: malloc msg");
+        respond_errno(client_stream, errno, "Could not allocate memory for a response");
+        return;
+    }
+    sprintf(msg, "<h1>Content of %s</h1>", path);
+
+    // Read directory content
+    char line[1024];
+    while ((dir_entry = readdir(dir)) != NULL) {
+        // Build line
+        sprintf(line, "<a href=\"%s\">%s</a><br>", dir_entry->d_name, dir_entry->d_name);
+
+        // Check if buffer is large enough to store the old message + the current line
+        size_t needed_msg_len = strlen(line) + strlen(msg) + 1;
+        if (needed_msg_len > msg_len) {
+            // Allocate memory for the old msg + the new line + \0 byte
+            char* old_msg = msg;
+            msg_len = 2 * needed_msg_len;
+            msg = malloc(msg_len);
+            if (msg == NULL) {
+                perror("respond_directory: malloc msg");
+                respond_errno(client_stream, errno, "Could not allocate memory for a response");
+                return;
+            }
+            // Copy old_msg and free its space
+            strcpy(msg, old_msg);
+            free(old_msg);
+        }
+        strcat(msg, line);
+    }
+
+    respond_header(client_stream, strlen(msg), 200);
+    fputs(msg, client_stream);
+
+    if (closedir(dir) < 0) {
+        perror("respond_directory: closedir");
+        return;
+    }
 }
 
 void handle_request(int client_socket, struct sockaddr_in client_addr) {
+    // Open client socket as stream
     FILE *client_stream = fdopen(client_socket, "r+");
     if (client_stream == NULL) {
-        perror("handle_request: fdopen");
+        perror("handle_request: fdopen client socket");
+        if (close(client_socket) < 0) {
+            perror("handle_request: close client socket");
+        }
         return;
     }
 
@@ -935,16 +999,26 @@ void handle_request(int client_socket, struct sockaddr_in client_addr) {
     char path[64];
     fscanf(client_stream, "%s %s", method, path);
 
+    // Read and ignore header until
     char discard[MAX_MSG_LEN];
-    fgets(discard, MAX_MSG_LEN, client_stream);
-    while(strcmp(discard, "\r\n") != 0) {
+    do {
         fgets(discard, MAX_MSG_LEN, client_stream);
-    }
+    } while (memcmp(discard, "\r\n", 2) != 0);
 
-    char* path_trimmed = path + 1; // Remove leading '/'
+    // Remove leading '/'
+    char* path_trimmed = path + 1;
     printf("%s %s from %s:%d\n", method, path_trimmed, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-    respond_file(client_stream, path_trimmed);
+    struct stat path_stat;
+    stat(path_trimmed, &path_stat);
+
+    if (S_ISDIR(path_stat.st_mode)) {
+        // Path is directory
+        respond_directory(client_stream, path_trimmed);
+    } else if (S_ISREG(path_stat.st_mode)) {
+        // Path is file
+        respond_file(client_stream, path_trimmed);
+    }
 
     if (fclose(client_stream) < 0) {
         perror("close client client_stream");
@@ -967,7 +1041,6 @@ void accept_incoming_request() {
         return;
     }
     handle_request(client_socket, client_addr);
-    printf("\n");
 }
 
 int main() {
