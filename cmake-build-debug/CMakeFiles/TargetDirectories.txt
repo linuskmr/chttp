@@ -1,3 +1,0 @@
-/home/linus/CLionProjects/chttp/cmake-build-debug/CMakeFiles/edit_cache.dir
-/home/linus/CLionProjects/chttp/cmake-build-debug/CMakeFiles/rebuild_cache.dir
-/home/linus/CLionProjects/chttp/cmake-build-debug/CMakeFiles/chttp.dir
